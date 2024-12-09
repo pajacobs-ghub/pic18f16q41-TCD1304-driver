@@ -1,6 +1,7 @@
 // tcd1304-driver.c
 // Drive the TCD1304DG clock signals with a PIC18F16Q41-I/P.
-// PJ 2024-11-25
+// PJ 2024-11-25 Basic clocking working with fixed periods.
+//    2024-12-10 Adjustable periods.
 
 // PIC18F16Q41 Configuration Bit Settings (generated in Memory View)
 // CONFIG1
@@ -64,14 +65,26 @@
 #define CLMpin LATCbits.LATC5
 #define SHpin LATCbits.LATC6
 
-void init_pins()
+void init_pins_for_pwm()
 {
     ICGpin = 1; ANSELCbits.ANSELC4 = 0; TRISCbits.TRISC4 = 0;
     CLMpin = 0; ANSELCbits.ANSELC5 = 0; TRISCbits.TRISC5 = 0;
     SHpin = 0; ANSELCbits.ANSELC6 = 0; TRISCbits.TRISC6 = 0;
+    //
+    // Connect the output of PWMs to the relevant output pins.
+    GIE = 0; // We run without interrupt.
+    PPSLOCK = 0x55;
+    PPSLOCK = 0xaa;
+    PPSLOCKED = 0;
+    RC5PPS = 0x0a; // PWM1S1P1_OUT
+    RC6PPS = 0x0c; // PWM2S1P1_OUT
+    RC4PPS = 0x0e; // PWM3S1P1_OUT
+    PPSLOCK = 0x55;
+    PPSLOCK = 0xaa;
+    PPSLOCKED = 1;
 }
 
-void init_pwm123()
+void init_pwm123(uint16_t period_SH_us, uint16_t period_ICG_us)
 {
     // Use PWM1 module for the master clock signal, CLM.
     // We want a 2MHz 50% duty signal, once started.
@@ -86,32 +99,20 @@ void init_pwm123()
     // Use PWM2 for SH, presently we want a fixed t_INT
     PWM2CONbits.EN = 0;
     PWM2CLKbits.CLK = 0b0010;  // FOSC (period of incoming clock 1/64 us)
-    PWM2CPRE = 16-1; // period for PWM clock = 1/4 us
-    PWM2PR = 400*4-1; // period for SH
+    PWM2CPRE = 64-1; // period for PWM clock = 1 us
+    PWM2PR = period_SH_us-1;
     PWM2S1CFGbits.MODE = 0; // left aligned, so we start active
-    PWM2S1P1 = 8; // 2 us pulse
+    PWM2S1P1 = 2; // 2 us pulse
     //
-    // Use PWM3 for ICG, presently gives overall cycle of 8ms.
-    // This sets the read cycle time.
+    // Use PWM3 for ICG.
+    // This sets the read cycle time and should be an exact multiple of t_INT.
     PWM3CONbits.EN = 0;
     PWM3CLKbits.CLK = 0b0010;  // FOSC (period of incoming clock 1/64 us)
-    PWM3CPRE = 16-1; // period for PWM clock = 1/4 us
-    PWM3PR = 8000*4-1; // period for ICG
+    PWM3CPRE = 64-1; // period for PWM clock = 1 us
+    PWM3PR = period_ICG_us-1;
     PWM3S1CFGbits.MODE = 0; // left aligned, so we start active
     PWM3S1CFGbits.POL1 = 1; // invert polarity to start low
-    PWM3S1P1 = 28; // 7 us low pulse
-    //
-    // Connect the output of CLCs to the relevant output pins.
-    GIE = 0; // We run without interrupt.
-    PPSLOCK = 0x55;
-    PPSLOCK = 0xaa;
-    PPSLOCKED = 0;
-    RC5PPS = 0x0a; // PWM1S1P1_OUT
-    RC6PPS = 0x0c; // PWM2S1P1_OUT
-    RC4PPS = 0x0e; // PWM3S1P1_OUT
-    PPSLOCK = 0x55;
-    PPSLOCK = 0xaa;
-    PPSLOCKED = 1;
+    PWM3S1P1 = 7; // 7 us low pulse
     //
     // Start the modules in a sequence.
     PWM3CONbits.EN = 1; // ICG
@@ -125,8 +126,8 @@ void init_pwm123()
 }
 
 int main() {
-    init_pins();
-    init_pwm123();
+    init_pins_for_pwm();
+    init_pwm123(200, 10000);
     while (1) {
         __delay_ms(1);
         CLRWDT();
