@@ -1,7 +1,7 @@
 // tcd1304-driver.c
 // Drive the TCD1304DG clock signals with a PIC18F16Q41-I/P.
 // PJ 2024-11-25 Basic clocking working with fixed periods.
-//    2024-12-10 Adjustable periods.
+//    2024-12-10 Adjustable periods and opamp as a buffer for VOS.
 
 // PIC18F16Q41 Configuration Bit Settings (generated in Memory View)
 // CONFIG1
@@ -125,7 +125,23 @@ void init_pwm123(uint16_t period_SH_us, uint16_t period_ICG_us)
     PWM2CONbits.EN = 1;
 }
 
+void init_opa1()
+{
+    // Set up for unity gain with
+    //   Input on pin 12, OPA1IN0+, RB5/ANB5
+    //   Output on pin 14, OPA1OUT, RC2/ANC2
+    TRISBbits.TRISB5 = 1; ANSELBbits.ANSELB5 = 1;
+    TRISCbits.TRISC2 = 1; ANSELCbits.ANSELC2 = 1;
+    OPA1CON2bits.PCH = 0b010; // non-inverting input is OPA1IN+ (PSS)
+    OPA1CON3bits.PSS = 0; // pin select OPA1IN0+ (RB5)
+    OPA1HWCbits.OREN = 0; // no hardware override
+    OPA1CON0bits.UG = 1; // unity gain
+    OPA1CON0bits.CPON = 1; // charge-pump on
+    OPA1CON0bits.EN = 1; // turn module on
+}
+
 int main() {
+    init_opa1();
     init_pins_for_pwm();
     init_pwm123(200, 10000);
     while (1) {
