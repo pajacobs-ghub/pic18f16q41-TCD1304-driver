@@ -1,7 +1,11 @@
 // tcd1304-driver.c
 // Drive the TCD1304DG clock signals with a PIC18F16Q41-I/P.
+// Accept period values from the I2C bus.
+//
 // PJ 2024-11-25 Basic clocking working with fixed periods.
-//    2024-12-10 Adjustable periods and opamp as a buffer for VOS.
+//    2024-12-10 Adjustable periods and op-amp as a buffer for VOS.
+//               Bring over the simple I2C client functions from
+//               the simple I2C client example for the PIC18F16Q41.
 
 // PIC18F16Q41 Configuration Bit Settings (generated in Memory View)
 // CONFIG1
@@ -64,6 +68,156 @@
 #define ICGpin LATCbits.LATC4
 #define CLMpin LATCbits.LATC5
 #define SHpin LATCbits.LATC6
+
+// Our chosen slave address.
+// Note that this number appears in a couple of the messages below.
+#define I2C_ADDR7  0x51
+// The largest Newhaven serial LCD command seems to be 11 bytes.
+#define BUFFER_LEN 16
+static volatile unsigned char receive_buf[BUFFER_LEN];
+static volatile unsigned char send_buf[BUFFER_LEN];
+static volatile unsigned char bytes_received = 0;
+static volatile unsigned char send_indx = 0;
+
+void i2c_init()
+{
+    // Configure PPS I2C1_SCL=RB6, I2C1_SDA=RB4
+    // Open-drain outputs, with pull-up and fast-mode slew-rate 
+    TRISBbits.TRISB4 = 0;
+    TRISBbits.TRISB6 = 0;
+    ODCONBbits.ODCB4 = 1;
+    ODCONBbits.ODCB6 = 1;
+    WPUBbits.WPUB4 = 1;
+    WPUBbits.WPUB6 = 1;
+    RB4I2Cbits.I2CPU = 0b01; // 2X pull-up
+    RB6I2Cbits.I2CPU = 0b01;
+    RB4I2Cbits.SLEW = 0b01; // fast-mode slew rate enabled
+    RB6I2Cbits.SLEW = 0b01;
+    ANSELBbits.ANSELB4 = 0;
+    ANSELBbits.ANSELB6 = 0;
+    GIE = 0;
+    PPSLOCK = 0x55;
+    PPSLOCK = 0xaa;
+    PPSLOCKED = 0;
+    I2C1SCLPPS = 0b001110; // RB6
+    RB6PPS = 0x21; // I2C1 SCL
+    I2C1SDAPPS = 0b001100; // RB4
+    RB4PPS = 0x22; // I2C1 SDA
+    PPSLOCK = 0x55;
+    PPSLOCK = 0xaa;
+    PPSLOCKED = 1;
+    //
+    // Slave mode with 7-bit address.
+    I2C1CON0 = 0;
+    // Clock stretching is enabled.
+    // I2C1CON1 = 0;
+    // Fast-mode enable, allow address buffer, 30ns hold, 8 clk pulses for bus free
+    I2C1CON2 = 0x28;
+    //
+    I2C1ADR0 = I2C_ADDR7 << 1;  // LSB is don't care
+    //
+    // Interrupts
+    I2C1PIR = 0; // Clear flags in module
+    I2C1PIEbits.ACKTIE = 1; // Acknowledge-time (9th clock pulse)
+    I2C1PIEbits.PCIE = 1; // Stop condition
+    PIR7bits.I2C1IF = 0;
+    PIE7bits.I2C1IE = 1;
+    INTCON0bits.IPEN = 0; // No priority for interrupts; all high priority
+    INTCON0bits.GIEH = 1; // Enable high-priority interrupts
+    //
+    I2C1CON0bits.EN = 1; // Enable module
+    return;
+}
+
+void i2c_close()
+{
+    di();
+    I2C1CON0bits.EN = 0;
+    return;
+}
+
+void __interrupt() i2c_service()
+// Implement the state-table approach shown in Microchip App Note 734
+// and the slave mode example (6) from TB3159.
+{
+    unsigned char junk, i;
+    if (PIR7bits.I2C1IF) {
+        PIR7bits.I2C1IF = 0;
+        if (I2C1PIRbits.ACKTIF) {
+            I2C1PIRbits.ACKTIF = 0;
+            // Slave mode is active following a start condition.
+            // If a stop condition has been seen, slave mode will not be active.
+            if (!I2C1STAT0bits.SMA) {
+                I2C1CON0bits.CSTR = 0; // Release clock.
+                return;
+            }
+            // At this point slave mode is active, so we should do something.
+            if (!I2C1STAT0bits.R && !I2C1STAT0bits.D) {
+                // State 1: i2c write operation, incoming byte is an address
+                // and that matching address would have been loaded into I2C1ADB0.
+                // Prepare to collect incoming data bytes.
+                for ( i = 0; i < BUFFER_LEN; ++i ) receive_buf[i] = 0;
+                bytes_received = 0;
+                I2C1CON0bits.CSTR = 0; // Release clock.
+                return;
+            }
+            if (!I2C1STAT0bits.R && I2C1STAT0bits.D) {
+                // State 2: i2c write operation, incoming byte is data.
+                while (!I2C1STAT1bits.RXBF) { /* wait */ } 
+                if (bytes_received < BUFFER_LEN) {
+                    receive_buf[bytes_received] = I2C1RXB;
+                    bytes_received++;
+                } else {
+                    // Buffer is full, discard incoming byte.
+                    junk = I2C1RXB;
+                }
+                I2C1CON0bits.CSTR = 0; // Release clock.
+                return;
+            }
+            if (I2C1STAT0bits.R && !I2C1STAT0bits.D) {
+                // State 3: i2c read operation, incoming byte is address
+                // and it will have been loaded into I2C1ADB0 already.
+                send_indx = 0;
+                bytes_received = 0; // Discard the last received message, too.
+                I2C1STAT1bits.TXWE = 0;
+                while (!I2C1STAT1bits.TXBE) { /* wait */ } 
+                I2C1TXB = send_buf[send_indx];
+                I2C1CON0bits.CSTR = 0; // Release clock.
+                send_indx++;
+                if (send_indx == BUFFER_LEN) send_indx = 0; // wrap around
+                return;
+            }
+            if (I2C1STAT0bits.R && I2C1STAT0bits.D) {
+                // State 4: i2c read operation, last byte was data
+                I2C1STAT1bits.TXWE = 0;
+                if (I2C1CON1bits.ACKSTAT == 0) {
+                    // Acknowledge received for previous byte; master wants more.
+                    while (!I2C1STAT1bits.TXBE) { /* wait */ } 
+                    I2C1TXB = send_buf[send_indx];
+                    send_indx++;
+                    if (send_indx == BUFFER_LEN) send_indx = 0; // wrap around
+                } else {
+                    // Master sent NACK; no need to send any more data.
+                }
+                I2C1CON0bits.CSTR = 0; // Release clock.
+                return;
+            }
+            if (I2C1STAT0bits.D && I2C1CON1bits.ACKSTAT) {
+                // State 5: Master NACK after data byte.
+                // Nothing special to do.
+                I2C1CON0bits.CSTR = 0; // Release clock.
+                return;
+            }
+            // If we get this point, something has gone wrong.
+            while ( 1 ) ; // Block until watch dog barks.
+        }
+        if (I2C1PIRbits.PCIF) {
+            I2C1PIRbits.PCIF = 0;
+            // If a stop condition has been seen, slave mode will not be active.
+            if (!I2C1STAT0bits.SMA) return;
+        }
+    }
+} // end i2c_service()
 
 void init_pins_for_pwm()
 {
@@ -140,12 +294,62 @@ void init_opa1()
     OPA1CON0bits.EN = 1; // turn module on
 }
 
-int main() {
+int main()
+{
+    unsigned char cmd[BUFFER_LEN];
+    unsigned char new_cmd = 0;
+    uint8_t nbytes;
+    uint16_t period_SH = 200; // Sets t_INT in microseconds
+    uint16_t period_ICG = 10000; // Sets read period in microseconds.
+    //
     init_opa1();
     init_pins_for_pwm();
-    init_pwm123(200, 10000);
+    // Start the TCD1304 clocking signals with default values
+    // for the SH and IGC periods.
+    init_pwm123(period_SH, period_ICG);
+    //
+    // Start the I2C interrupt service and just sit back waiting for commands.
+    i2c_init();
+    ei(); // The i2c_service routine is called via interrupt.
+    // Put something in the send buffer so that the I2C master can ask for it.
+    for (unsigned char i = 0; i < BUFFER_LEN; ++i) send_buf[i] = i;
+    // Main loop.
     while (1) {
-        __delay_ms(1);
+        // Disable interrupts while we access the I2C buffer.
+        di();
+        // We will make a copy of the I2C receive buffer to allow
+        // the command interpreter to work on it safely.
+        if (bytes_received) {
+            for (unsigned char i = 0; i < bytes_received; ++i) cmd[i] = receive_buf[i];
+            nbytes = bytes_received;
+            bytes_received = 0; // Indicate that we have taken the bytes.
+            new_cmd = 1; // and flag that we have a command to work on.
+        } else {
+            new_cmd = 0;
+        }
+        ei();
+        if (!new_cmd) {
+            // There is no new command, so just waste a bit of time.
+            __delay_ms(1);
+            CLRWDT();
+            continue;
+        }
+        // Interpret the command bytes.
+        if (nbytes == 4)
+        {
+            // Bytes arrive over the wire in big-endian order.
+            period_SH = (uint16_t) cmd[0]<<8 | cmd[1];
+            period_ICG = (uint16_t) cmd[2]<<8 | cmd[3];
+            init_pwm123(period_SH, period_ICG);
+        }
+        //
+        // Now we have interpreted the command bytes, clean up.
+        for (unsigned char i = 0; i < BUFFER_LEN; ++i) cmd[i] = 0;
+        new_cmd = 0;
         CLRWDT();
-    }
+    } // end while 1
+    //
+    // Don't expect to arrive here...
+    i2c_close();
+    return 0;
 }
