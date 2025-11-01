@@ -6,6 +6,7 @@
 //    2024-12-10 Adjustable periods and op-amp as a buffer for VOS.
 //               Bring over the simple I2C client functions from
 //               the simple I2C client example for the PIC18F16Q41.
+//    2025-11-02 Don't take message until I2C module is done with it.
 
 // PIC18F16Q41 Configuration Bit Settings (generated in Memory View)
 // CONFIG1
@@ -75,8 +76,9 @@
 // The largest Newhaven serial LCD command seems to be 11 bytes.
 #define BUFFER_LEN 16
 static volatile unsigned char receive_buf[BUFFER_LEN];
-static volatile unsigned char send_buf[BUFFER_LEN];
+static unsigned char send_buf[BUFFER_LEN];
 static volatile unsigned char bytes_received = 0;
+static volatile unsigned char i2c_is_active = 0;
 static volatile unsigned char send_indx = 0;
 
 void i2c_init()
@@ -148,8 +150,11 @@ void __interrupt() i2c_service()
             // Slave mode is active following a start condition.
             // If a stop condition has been seen, slave mode will not be active.
             if (!I2C1STAT0bits.SMA) {
+                i2c_is_active = 0;
                 I2C1CON0bits.CSTR = 0; // Release clock.
                 return;
+            } else {
+                i2c_is_active = 1;
             }
             // At this point slave mode is active, so we should do something.
             if (!I2C1STAT0bits.R && !I2C1STAT0bits.D) {
@@ -214,7 +219,10 @@ void __interrupt() i2c_service()
         if (I2C1PIRbits.PCIF) {
             I2C1PIRbits.PCIF = 0;
             // If a stop condition has been seen, slave mode will not be active.
-            if (!I2C1STAT0bits.SMA) return;
+            if (!I2C1STAT0bits.SMA) {
+                i2c_is_active = 0;
+                return;
+            }
         }
     }
 } // end i2c_service()
@@ -319,7 +327,7 @@ int main()
         di();
         // We will make a copy of the I2C receive buffer to allow
         // the command interpreter to work on it safely.
-        if (bytes_received) {
+        if (bytes_received && !i2c_is_active) {
             for (unsigned char i = 0; i < bytes_received; ++i) cmd[i] = receive_buf[i];
             nbytes = bytes_received;
             bytes_received = 0; // Indicate that we have taken the bytes.
